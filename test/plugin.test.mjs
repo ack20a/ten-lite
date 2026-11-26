@@ -1,0 +1,1009 @@
+/**
+ * Unit tests for the CloudBase Bridge plugin (built output dist/index.js —
+ * the artifact Magpie actually loads).
+ *
+ * Run: npm test  (node --test)
+ */
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import * as pluginModule from "../dist/index.js";
+
+const { CloudbaseBridge, _internal, PLUGIN_VERSION } = pluginModule;
+
+const TEST_KEY = "test-apikey-not-a-real-secret";
+
+/** Build a plugin instance with mocked logging. */
+async function makePlugin() {
+  const logs = [];
+  const input = {
+    client: {
+      app: {
+        log: async (args) => {
+          logs.push(args);
+        },
+      },
+    },
+    project: { id: "test" },
+    directory: "/tmp",
+  };
+  const hooks = await CloudbaseBridge(input, {});
+  return { hooks, logs };
+}
+
+/** Fake auth as stored by Magpie after `magpie plugin login cloudbase`. */
+function fakeAuth(overrides = {}) {
+  return {
+    type: "api",
+    key: TEST_KEY,
+    metadata: { envId: "env-test-1", region: "cn", functionName: "aiProxy", ...overrides },
+  };
+}
+
+/** Install a mock CloudBase gateway on globalThis.fetch; returns the calls. */
+function mockGateway(handler) {
+  const original = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url: String(url), init });
+    return handler(url, init, calls);
+  };
+  return {
+    calls,
+    restore() {
+      globalThis.fetch = original;
+    },
+  };
+}
+
+/** A chat.completion body exactly as aiProxy returns it. */
+function aiProxyCompletion(content = "hello from hy3", usage = { prompt_tokens: 9, completion_tokens: 5, total_tokens: 14 }) {
+  return {
+    id: "chatcmpl-test001",
+    object: "chat.completion",
+    created: 1_762_700_000,
+    model: "hy3",
+    choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: "stop" }],
+    usage,
+  };
+}
+
+function chatBody(overrides = {}) {
+  return JSON.stringify({
+    model: "hy3",
+    messages: [{ role: "user", content: "hi" }],
+    stream: false,
+    ...overrides,
+  });
+}
+
+async function loaderFetch(hooks, auth = fakeAuth()) {
+  const loader = await hooks.auth.loader(async () => auth);
+  assert(loader && typeof loader.fetch === "function", "loader must return a fetch");
+  return (body, init = {}) => loader.fetch("https://placeholder/v1/chat/completions", { method: "POST", body, ...init });
+}
+
+/* ---------------- module shape ---------------- */
+
+test("module exports only the plugin function and the _internal object", () => {
+  const exportKeys = Object.keys(pluginModule).sort();
+  assert.deepEqual(exportKeys, ["CloudbaseBridge", "PLUGIN_VERSION", "_internal"]);
+  assert.equal(typeof CloudbaseBridge, "function");
+  assert.equal(typeof _internal, "object");
+  assert.ok(!("server" in _internal), "_internal must not look like a { server } export");
+  assert.equal(typeof PLUGIN_VERSION, "string");
+});
+
+/* ---------------- normalizeModel ---------------- */
+
+test("normalizeModel strips provider prefixes only at the boundary", () => {
+  assert.equal(_internal.normalizeModel("cloudbase/hy3"), "hy3");
+  assert.equal(_internal.normalizeModel("cloudbase-plugin/hy3"), "hy3");
+  assert.equal(_internal.normalizeModel("cloudbase/cloudbase/hy3"), "hy3");
+  assert.equal(_internal.normalizeModel("hy3"), "hy3");
+  assert.equal(_internal.normalizeModel("cloudbase/hy3 "), "hy3");
+  assert.equal(_internal.normalizeModel("other/hy3"), "other/hy3");
+  assert.equal(_internal.normalizeModel("cloudbase/"), null);
+  assert.equal(_internal.normalizeModel(""), null);
+  assert.equal(_internal.normalizeModel(undefined), null);
+  assert.equal(_internal.normalizeModel(42), null);
+});
+
+/* ---------------- config hook ---------------- */
+
+test("config hook declares provider with catalog; ??= preserves user config", async () => {
+  const { hooks } = await makePlugin();
+
+  const cfg = {};
+  await hooks.config(cfg);
+  const provider = cfg.provider.cloudbase;
+  assert.ok(provider);
+  assert.equal(provider.npm, "@ai-sdk/openai-compatible");
+  const models = provider.models;
+  for (const id of ["hy4-flash", "hy3", "hy4", "hy4-preview", "deepseek-v4.1-flash", "deepseek-v4.1-flash-1017"]) {
+    assert.ok(models[id], `catalog must contain ${id}`);
+  }
+  assert.ok(!models["hy4"].disabled, "hy4 is enabled in the 2026-11-23 refresh");
+  assert.ok(!models["deepseek-v4.1-flash-1017"].disabled, "verified 1017 must be enabled by default");
+  assert.ok(!models["hy3"].disabled && !models["hy4-preview"].disabled && !models["deepseek-v4.1-flash"].disabled);
+  assert.equal(models["deepseek-v4.1-flash-1017"].name, "DeepSeek V4.1 Flash 1017");
+  assert.equal(models["hy3"].tool_call, true);
+  // Image input per the official model list: every model but hy3.
+  for (const [id, model] of Object.entries(models)) {
+    assert.deepEqual(model.modalities, { input: id === "hy3" ? ["text"] : ["text", "image"], output: ["text"] }, id);
+  }
+
+  // Second run must not overwrite user config.
+  const userCfg = { provider: { cloudbase: { name: "Mine", models: { custom: {} } } } };
+  await hooks.config(userCfg);
+  assert.equal(userCfg.provider.cloudbase.name, "Mine");
+  assert.ok(userCfg.provider.cloudbase.models.custom);
+});
+
+test("catalog contexts match the documented model table", async () => {
+  const { hooks } = await makePlugin();
+  const cfg = {};
+  await hooks.config(cfg);
+  const models = cfg.provider.cloudbase.models;
+  const expected = {
+    "hy4-flash": 1_000_000,
+    hy3: 262_144,
+    hy4: 1_000_000,
+    "hy4-preview": 1_000_000,
+    "deepseek-v4.1-flash": 1_000_000,
+    "deepseek-v4.1-flash-1017": 1_000_000,
+  };
+  for (const [id, context] of Object.entries(expected)) {
+    assert.equal(models[id].limit.context, context, `catalog context of ${id} must match the README table`);
+  }
+});
+
+/* ---------------- loader & auth surface ---------------- */
+
+test("auth hook exposes provider id, api method and login prompts", async () => {
+  const { hooks } = await makePlugin();
+  assert.equal(hooks.auth.provider, "cloudbase");
+  const method = hooks.auth.methods[0];
+  assert.equal(method.type, "api");
+  const promptKeys = method.prompts.map((p) => p.key);
+  assert.deepEqual(promptKeys, ["envId", "region", "functionName"]);
+  assert.equal(method.prompts[0].validate("cloud1-abcdefgh"), undefined);
+  assert.notEqual(method.prompts[0].validate("bad id!"), undefined);
+  assert.equal(method.prompts[2].validate(""), undefined, "empty function name falls back to aiProxy");
+  assert.equal(method.prompts[2].validate("my_proxy-1"), undefined);
+  assert.notEqual(method.prompts[2].validate("1bad"), undefined);
+});
+
+test("loader returns empty config when not signed in", async () => {
+  const { hooks } = await makePlugin();
+  const loader = await hooks.auth.loader(async () => undefined);
+  assert.deepEqual(loader, {});
+});
+
+test("loader builds the gateway URL from envId/region", async () => {
+  const { hooks } = await makePlugin();
+  const cn = await hooks.auth.loader(async () => fakeAuth());
+  assert.ok(String(cn.baseURL).startsWith("https://env-test-1.api.tcloudbasegateway.com"));
+  const intl = await hooks.auth.loader(async () => fakeAuth({ region: "intl" }));
+  assert.ok(String(intl.baseURL).includes(".api.intl.tcloudbasegateway.com"));
+});
+
+/* ---------------- bridge: non-streaming ---------------- */
+
+test("bridge non-streaming: adapts aiProxy JSON, echoes requested model id, sends no stream field", async () => {
+  const { hooks } = await makePlugin();
+  const gw = mockGateway(async () => new Response(JSON.stringify(aiProxyCompletion()), { status: 200 }));
+  try {
+    const doFetch = await loaderFetch(hooks);
+    const res = await doFetch(chatBody({ model: "cloudbase/hy3" }));
+    assert.equal(res.status, 200);
+
+    const call = gw.calls[0];
+    assert.equal(call.url, "https://env-test-1.api.tcloudbasegateway.com/v1/functions/aiProxy");
+    assert.equal(call.init.headers.authorization, `Bearer ${TEST_KEY}`);
+    const sentEvent = JSON.parse(call.init.body);
+    assert.equal(sentEvent.action, "chat");
+    assert.equal(sentEvent.model, "hy3");
+    assert.equal("stream" in sentEvent, false);
+    assert.equal(sentEvent.messages.length, 1);
+
+    const payload = await res.json();
+    assert.equal(payload.object, "chat.completion");
+    assert.equal(payload.model, "cloudbase/hy3", "response must echo the requested model id");
+    assert.equal(payload.choices[0].message.content, "hello from hy3");
+    assert.deepEqual(payload.usage.total_tokens, 14);
+  } finally {
+    gw.restore();
+  }
+});
+
+test("bridge forwards image_url parts to aiProxy unchanged and counts them in the size limit", async () => {
+  const { hooks } = await makePlugin();
+  const gw = mockGateway(async () => new Response(JSON.stringify(aiProxyCompletion("a cat")), { status: 200 }));
+  const content = (url) => [{ type: "text", text: "what is this?" }, { type: "image_url", image_url: { url } }];
+  try {
+    const doFetch = await loaderFetch(hooks);
+    const small = "data:image/png;base64," + "A".repeat(4096);
+    const res = await doFetch(chatBody({ model: "cloudbase/hy4", messages: [{ role: "user", content: content(small) }] }));
+    assert.equal(res.status, 200);
+    assert.deepEqual(JSON.parse(gw.calls[0].init.body).messages, [{ role: "user", content: content(small) }]);
+
+    const huge = "data:image/png;base64," + "A".repeat(_internal.DEFAULT_MAX_EVENT_BYTES);
+    const tooBig = await doFetch(chatBody({ model: "cloudbase/hy4", messages: [{ role: "user", content: content(huge) }] }));
+    assert.equal(tooBig.status, 413);
+    assert.equal(gw.calls.length, 1, "an oversized image must not reach the function");
+  } finally {
+    gw.restore();
+  }
+});
+
+const WRITE_FILE_TOOL = {
+  type: "function",
+  function: { name: "write_file", description: "Write a file", parameters: { type: "object", properties: { path: { type: "string" } } } },
+};
+const WRITE_FILE_CALL = { id: "call_w1", type: "function", function: { name: "write_file", arguments: '{"path":"out.txt"}' } };
+
+function aiProxyToolCallCompletion() {
+  const completion = aiProxyCompletion("");
+  completion.choices[0] = {
+    index: 0,
+    message: { role: "assistant", content: null, tool_calls: [WRITE_FILE_CALL] },
+    finish_reason: "tool_calls",
+  };
+  return completion;
+}
+
+test("bridge forwards tools, tool_choice and max_tokens and returns the model's tool calls", async () => {
+  const { hooks } = await makePlugin();
+  const gw = mockGateway(async () => new Response(JSON.stringify(aiProxyToolCallCompletion()), { status: 200 }));
+  try {
+    const doFetch = await loaderFetch(hooks);
+    const messages = [
+      { role: "user", content: "write out.txt" },
+      { role: "assistant", content: null, tool_calls: [WRITE_FILE_CALL] },
+      { role: "tool", tool_call_id: "call_w1", content: "ok" },
+    ];
+    const res = await doFetch(chatBody({ messages, tools: [WRITE_FILE_TOOL], tool_choice: "auto", max_tokens: 64 }));
+    assert.equal(res.status, 200);
+
+    const sentEvent = JSON.parse(gw.calls[0].init.body);
+    assert.deepEqual(sentEvent.tools, [WRITE_FILE_TOOL]);
+    assert.equal(sentEvent.toolChoice, "auto");
+    assert.equal(sentEvent.maxTokens, 64);
+    assert.deepEqual(sentEvent.messages, messages);
+
+    const payload = await res.json();
+    assert.deepEqual(payload.choices[0].message, { role: "assistant", content: null, tool_calls: [WRITE_FILE_CALL] });
+    assert.equal(payload.choices[0].finish_reason, "tool_calls");
+
+    await doFetch(chatBody({ max_completion_tokens: 32, tool_choice: "auto" }));
+    const plainEvent = JSON.parse(gw.calls[1].init.body);
+    assert.equal(plainEvent.maxTokens, 32);
+    assert.equal("tools" in plainEvent, false);
+    assert.equal("toolChoice" in plainEvent, false, "tool_choice without tools is not forwarded");
+  } finally {
+    gw.restore();
+  }
+});
+
+test("bridge streaming: tool calls are emitted as indexed tool_calls deltas", async () => {
+  const { hooks } = await makePlugin();
+  const gw = mockGateway(async () => new Response(JSON.stringify(aiProxyToolCallCompletion()), { status: 200 }));
+  try {
+    const doFetch = await loaderFetch(hooks);
+    const res = await doFetch(chatBody({ stream: true, tools: [WRITE_FILE_TOOL] }));
+    const chunks = (await res.text())
+      .split("\n\n")
+      .filter((line) => line.startsWith("data: ") && line !== "data: [DONE]")
+      .map((line) => JSON.parse(line.slice("data: ".length)));
+    const toolDeltas = chunks.flatMap((c) => c.choices[0].delta.tool_calls ?? []);
+    assert.deepEqual(toolDeltas, [{ index: 0, ...WRITE_FILE_CALL }]);
+    assert.equal(chunks[chunks.length - 1].choices[0].finish_reason, "tool_calls");
+  } finally {
+    gw.restore();
+  }
+});
+
+test("bridge returns reasoning_content and keeps finish_reason length for truncated tool calls", async () => {
+  const { hooks } = await makePlugin();
+  const completion = aiProxyToolCallCompletion();
+  completion.choices[0].message.reasoning_content = "I need to write the file.";
+  completion.choices[0].finish_reason = "length";
+  const gw = mockGateway(async () => new Response(JSON.stringify(completion), { status: 200 }));
+  try {
+    const doFetch = await loaderFetch(hooks);
+    const history = [
+      { role: "user", content: "write out.txt" },
+      { role: "assistant", content: null, reasoning_content: "I need to write the file.", tool_calls: [WRITE_FILE_CALL] },
+      { role: "tool", tool_call_id: "call_w1", content: "ok" },
+    ];
+    const res = await doFetch(chatBody({ messages: history, tools: [WRITE_FILE_TOOL] }));
+    assert.deepEqual(JSON.parse(gw.calls[0].init.body).messages, history, "reasoning_content goes back to aiProxy");
+    const payload = await res.json();
+    assert.deepEqual(payload.choices[0].message, {
+      role: "assistant",
+      content: null,
+      tool_calls: [WRITE_FILE_CALL],
+      reasoning_content: "I need to write the file.",
+    });
+    assert.equal(payload.choices[0].finish_reason, "length");
+
+    const streamed = await doFetch(chatBody({ stream: true, tools: [WRITE_FILE_TOOL] }));
+    const chunks = (await streamed.text())
+      .split("\n\n")
+      .filter((line) => line.startsWith("data: ") && line !== "data: [DONE]")
+      .map((line) => JSON.parse(line.slice("data: ".length)));
+    const deltas = chunks.map((c) => c.choices[0].delta);
+    assert.equal(deltas.map((d) => d.reasoning_content ?? "").join(""), "I need to write the file.");
+    const firstTool = deltas.findIndex((d) => d.tool_calls);
+    const lastReasoning = deltas.findLastIndex((d) => d.reasoning_content);
+    assert.ok(lastReasoning < firstTool, "reasoning is streamed before the tool calls");
+    assert.equal(chunks[chunks.length - 1].choices[0].finish_reason, "length");
+  } finally {
+    gw.restore();
+  }
+});
+
+test("bridge drops tool calls whose arguments were cut off at the token limit", async () => {
+  const { hooks } = await makePlugin();
+  const completion = aiProxyToolCallCompletion();
+  const cutOff = { id: "call_w2", type: "function", function: { name: "write_file", arguments: '{"path":"ou' } };
+  completion.choices[0].message.tool_calls = [WRITE_FILE_CALL, cutOff];
+  completion.choices[0].finish_reason = "length";
+  const gw = mockGateway(async () => new Response(JSON.stringify(completion), { status: 200 }));
+  try {
+    const doFetch = await loaderFetch(hooks);
+    const payload = await (await doFetch(chatBody({ tools: [WRITE_FILE_TOOL] }))).json();
+    assert.deepEqual(payload.choices[0].message.tool_calls, [WRITE_FILE_CALL], "the complete call is kept");
+    assert.equal(payload.choices[0].finish_reason, "length");
+
+    const streamed = await (await doFetch(chatBody({ stream: true, tools: [WRITE_FILE_TOOL] }))).text();
+    assert.equal(streamed.includes("call_w2"), false);
+    assert.equal(streamed.includes("call_w1"), true);
+
+    completion.choices[0].message.tool_calls = [cutOff];
+    const onlyCutOff = await (await doFetch(chatBody({ tools: [WRITE_FILE_TOOL] }))).json();
+    assert.deepEqual(onlyCutOff.choices[0].message, { role: "assistant", content: "" });
+    assert.equal(onlyCutOff.choices[0].finish_reason, "length");
+  } finally {
+    gw.restore();
+  }
+});
+
+test("bridge leaves reasoning_content out when the model sends none", async () => {
+  const { hooks } = await makePlugin();
+  const gw = mockGateway(async () => new Response(JSON.stringify(aiProxyCompletion("plain")), { status: 200 }));
+  try {
+    const doFetch = await loaderFetch(hooks);
+    const payload = await (await doFetch(chatBody())).json();
+    assert.deepEqual(payload.choices[0].message, { role: "assistant", content: "plain" });
+    const streamed = await (await doFetch(chatBody({ stream: true }))).text();
+    assert.equal(streamed.includes("reasoning_content"), false);
+  } finally {
+    gw.restore();
+  }
+});
+
+/* ---------------- bridge: streaming ---------------- */
+
+test("bridge streaming: synthesizes SSE with role/content/finish chunks and [DONE]", async () => {
+  const { hooks } = await makePlugin();
+  const gw = mockGateway(async () => new Response(JSON.stringify(aiProxyCompletion("第一段。Second part!")), { status: 200 }));
+  try {
+    const doFetch = await loaderFetch(hooks);
+    const res = await doFetch(chatBody({ stream: true }));
+    assert.equal(res.status, 200);
+    assert.ok((res.headers.get("content-type") ?? "").includes("text/event-stream"));
+    assert.equal(res.headers.get("content-length"), null, "streamed body must not carry content-length");
+
+    const text = await res.text();
+    const frames = text
+      .split("\n\n")
+      .filter((line) => line.startsWith("data: "))
+      .map((line) => line.slice("data: ".length));
+    assert.equal(frames[frames.length - 1], "[DONE]");
+    const chunks = frames.slice(0, -1).map((f) => JSON.parse(f));
+    for (const chunk of chunks) {
+      assert.equal(chunk.object, "chat.completion.chunk");
+      assert.equal(chunk.model, "hy3");
+    }
+    const roleChunk = chunks[0];
+    assert.deepEqual(roleChunk.choices[0].delta.role, "assistant");
+    const content = chunks
+      .slice(1, -1)
+      .map((c) => c.choices[0].delta.content ?? "")
+      .join("");
+    assert.equal(content, "第一段。Second part!", "content chunks must reassemble exactly");
+    const final = chunks[chunks.length - 1];
+    assert.equal(final.choices[0].finish_reason, "stop");
+    assert.deepEqual(final.usage, { prompt_tokens: 9, completion_tokens: 5, total_tokens: 14 });
+  } finally {
+    gw.restore();
+  }
+});
+
+test("bridge streaming: respects agent abort (an already-aborted request rejects like native fetch)", async () => {
+  const { hooks } = await makePlugin();
+  const original = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    if (init?.signal?.aborted) {
+      throw new DOMException("This operation was aborted", "AbortError");
+    }
+    return new Response(JSON.stringify(aiProxyCompletion("x".repeat(500))), { status: 200 });
+  };
+  try {
+    const loader = await hooks.auth.loader(async () => fakeAuth());
+    const controller = new AbortController();
+    controller.abort(); // abort before the call, like a cancelled agent request
+    const resPromise = loader.fetch("https://placeholder/v1/chat/completions", {
+      method: "POST",
+      body: chatBody({ stream: true }),
+      signal: controller.signal,
+    });
+    await assert.rejects(() => resPromise, undefined, "an aborted request must reject");
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+/* ---------------- bridge: error mapping ---------------- */
+
+test("gateway error codes map to statuses that keep Magpie failover sane", async () => {
+  const { hooks } = await makePlugin();
+
+  const cases = [
+    ["FUNCTIONS_NOT_FOUND", 404, /deploy/i],
+    ["PERMISSION_DENIED", 401, /API key/],
+    ["EXCEED_AUTHORITY", 403, /security rules/i],
+    ["AI_CHANNEL_NOT_ALLOWED", 403, /invocation source/i],
+    ["AI_MODEL_NOT_SUPPORTED", 404, /model/i],
+    ["EXCEED_TOKEN_QUOTA_LIMIT", 429, /quota/i],
+    ["FUNCTIONS_TIME_LIMIT_EXCEEDED", 504, /timeout/i],
+    ["FUNCTIONS_INVOCATION_FAILED", 502, /logs/i],
+    ["SOMETHING_ELSE", 400, /SOMETHING_ELSE/],
+  ];
+
+  for (const [code, expectedStatus, messageMatch] of cases) {
+    const gw = mockGateway(async () =>
+      new Response(JSON.stringify({ code, message: `upstream says ${code}`, requestId: "req-x" }), { status: 400 }),
+    );
+    try {
+      const doFetch = await loaderFetch(hooks);
+      const res = await doFetch(chatBody());
+      assert.equal(res.status, expectedStatus, `code ${code} must map to ${expectedStatus}`);
+      const payload = await res.json();
+      assert.equal(payload.error.code, code);
+      assert.match(payload.error.message, messageMatch);
+      assert.match(payload.error.message, /upstream says/, "must surface the upstream message for diagnosis");
+      assert.equal(payload.error.requestId, "req-x");
+      assert.ok(!JSON.stringify(payload).includes(TEST_KEY), "no API key in errors");
+    } finally {
+      gw.restore();
+    }
+  }
+});
+
+test("aiProxy error envelopes map by code", async () => {
+  const { hooks } = await makePlugin();
+  const cases = [
+    [{ code: "INVALID_REQUEST", message: "bad" }, 400],
+    [{ code: "MODEL_NOT_ALLOWED", message: "nope" }, 404],
+    [{ code: "AI_MODEL_NOT_SUPPORTED", message: "nope" }, 404],
+    [{ code: "AI_CHANNEL_NOT_ALLOWED", message: "nope" }, 403],
+    [{ code: "EXCEED_TOKEN_QUOTA_LIMIT", message: "nope" }, 429],
+    [{ code: "TCB_ENV_MISSING", message: "no TCB_ENV" }, 502],
+    [{ code: "UPSTREAM_ERROR", message: "boom" }, 502],
+  ];
+  for (const [envelope, expectedStatus] of cases) {
+    const gw = mockGateway(async () => new Response(JSON.stringify({ error: envelope }), { status: 200 }));
+    try {
+      const doFetch = await loaderFetch(hooks);
+      const res = await doFetch(chatBody());
+      assert.equal(res.status, expectedStatus, `${envelope.code} -> ${expectedStatus}`);
+      const payload = await res.json();
+      assert.equal(payload.error.code, envelope.code);
+    } finally {
+      gw.restore();
+    }
+  }
+});
+
+test("non-JSON and shapeless aiProxy replies become 502", async () => {
+  const { hooks } = await makePlugin();
+
+  const gw1 = mockGateway(async () => new Response("<html>boom</html>", { status: 200 }));
+  try {
+    const doFetch = await loaderFetch(hooks);
+    const res = await doFetch(chatBody());
+    assert.equal(res.status, 502);
+    const payload = await res.json();
+    assert.equal(payload.error.code, "INVALID_FUNCTION_JSON");
+  } finally {
+    gw1.restore();
+  }
+
+  const gw2 = mockGateway(async () => new Response(JSON.stringify({ unexpected: true }), { status: 200 }));
+  try {
+    const doFetch = await loaderFetch(hooks);
+    const res = await doFetch(chatBody());
+    assert.equal(res.status, 502);
+    const payload = await res.json();
+    assert.equal(payload.error.code, "INVALID_FUNCTION_RESPONSE");
+  } finally {
+    gw2.restore();
+  }
+});
+
+test("unknown model ids are rejected locally with 404 (no cloud call)", async () => {
+  const { hooks } = await makePlugin();
+  const gw = mockGateway(async () => new Response("{}", { status: 200 }));
+  try {
+    const doFetch = await loaderFetch(hooks);
+    const res = await doFetch(chatBody({ model: "gpt-4o" }));
+    assert.equal(res.status, 404);
+    const payload = await res.json();
+    assert.match(payload.error.message, /Known models:/);
+    assert.equal(gw.calls.length, 0, "must not spend a cloud invocation on unknown models");
+  } finally {
+    gw.restore();
+  }
+});
+
+test("oversized conversations are rejected with 413", async () => {
+  const { hooks } = await makePlugin();
+  const doFetch = await loaderFetch(hooks);
+  const res = await doFetch(
+    chatBody({ messages: [{ role: "user", content: "x".repeat(_internal.DEFAULT_MAX_EVENT_BYTES) }] }),
+  );
+  assert.equal(res.status, 413);
+});
+
+test("an agent history well past the old 512 KiB limit is forwarded", async () => {
+  const { hooks } = await makePlugin();
+  let forwardedBytes = 0;
+  const gw = mockGateway(async (_url, init) => {
+    forwardedBytes = new TextEncoder().encode(String(init.body)).byteLength;
+    return new Response(JSON.stringify(aiProxyCompletion()), { status: 200 });
+  });
+  try {
+    const doFetch = await loaderFetch(hooks);
+    const messages = [];
+    for (let i = 0; i < 400; i += 1) {
+      messages.push({ role: i % 2 === 0 ? "user" : "assistant", content: "历史".repeat(1_000) });
+    }
+    messages.push({ role: "user", content: "continue" });
+    const res = await doFetch(chatBody({ messages }));
+    assert.equal(res.status, 200);
+    assert.ok(forwardedBytes > 2 * 1024 * 1024, `forwarded ${forwardedBytes} bytes`);
+  } finally {
+    gw.restore();
+  }
+});
+
+test("payload limit counts UTF-8 bytes, not JavaScript string length (CJK content)", async () => {
+  const { hooks } = await makePlugin();
+  const gw = mockGateway(async () => new Response(JSON.stringify(aiProxyCompletion()), { status: 200 }));
+  try {
+    const doFetch = await loaderFetch(hooks);
+
+    // Small CJK request passes normally.
+    const okRes = await doFetch(chatBody({ messages: [{ role: "user", content: "你好，世界" }] }));
+    assert.equal(okRes.status, 200);
+
+    // Half the limit in CJK chars: fewer UTF-16 code units than the limit
+    // (a naive .length check would forward it), but 1.5x the limit in
+    // UTF-8 bytes.
+    const cjk = "好".repeat(_internal.DEFAULT_MAX_EVENT_BYTES / 2);
+    assert.ok(cjk.length < _internal.DEFAULT_MAX_EVENT_BYTES, "precondition: string length is under the limit");
+    assert.ok(
+      new TextEncoder().encode(cjk).byteLength > _internal.DEFAULT_MAX_EVENT_BYTES,
+      "precondition: UTF-8 byte count is over the limit",
+    );
+
+    const res = await doFetch(chatBody({ messages: [{ role: "user", content: cjk }] }));
+    assert.equal(res.status, 413);
+    const payload = await res.json();
+    assert.equal(payload.error.code, "PAYLOAD_TOO_LARGE");
+    const match = payload.error.message.match(/too large \((\d+) bytes; limit (\d+) bytes\)/);
+    assert.ok(match, `error message must report byte counts with byte units: ${payload.error.message}`);
+    assert.ok(Number(match[1]) > Number(match[2]), "reported size must exceed the limit");
+    assert.ok(Number(match[1]) >= 3 * cjk.length, "reported size must be the UTF-8 byte count, not the char count");
+  } finally {
+    gw.restore();
+  }
+});
+
+test("client-side timeout maps to 504 and network errors to 502", async () => {
+  const { hooks } = await makePlugin();
+
+  // Timeout via options.timeoutMs override on a slow gateway. The mock
+  // honors the AbortSignal like native fetch does (rejects when it fires).
+  const plugin = await CloudbaseBridge({}, { timeoutMs: 300, envId: "env-test-1", functionName: "aiProxy" });
+  const original = globalThis.fetch;
+  globalThis.fetch = (url, init) =>
+    new Promise((resolve, reject) => {
+      const timer = setTimeout(() => resolve(new Response("{}", { status: 200 })), 30_000);
+      init?.signal?.addEventListener(
+        "abort",
+        () => {
+          clearTimeout(timer);
+          reject(init.signal.reason ?? new DOMException("aborted", "TimeoutError"));
+        },
+        { once: true },
+      );
+    });
+  try {
+    const loader = await plugin.auth.loader(async () => fakeAuth());
+    const res = await loader.fetch("https://placeholder/v1/chat/completions", {
+      method: "POST",
+      body: chatBody(),
+    });
+    assert.equal(res.status, 504);
+    const payload = await res.json();
+    assert.equal(payload.error.code, "INVOKE_TIMEOUT");
+  } finally {
+    globalThis.fetch = original;
+  }
+
+  // Network failure.
+  const plugin2 = await CloudbaseBridge({}, {});
+  const gw2 = mockGateway(async () => {
+    throw new Error("ECONNREFUSED");
+  });
+  try {
+    const loader = await plugin2.auth.loader(async () => fakeAuth());
+    const res = await loader.fetch("https://placeholder/v1/chat/completions", {
+      method: "POST",
+      body: chatBody(),
+    });
+    assert.equal(res.status, 502);
+    const payload = await res.json();
+    assert.equal(payload.error.code, "NETWORK_ERROR");
+    assert.ok(!JSON.stringify(payload).includes(TEST_KEY));
+  } finally {
+    gw2.restore();
+  }
+});
+
+/* ---------------- provider.models ---------------- */
+
+test("provider.models: a ping-only model is built in the host's model shape", async () => {
+  const { hooks } = await makePlugin();
+  // Shape the host passes to provider.models (OpenCode Model), with hy3 and
+  // a custom id missing because the user's config left them out.
+  const hy4 = {
+    id: "hy4",
+    name: "Hunyuan 4",
+    api: { id: "hy4", url: "https://cloudbase-bridge.invalid/v1", npm: "@ai-sdk/openai-compatible" },
+    limit: { context: 1_000_000, output: 16_384 },
+    capabilities: {
+      reasoning: false,
+      toolcall: true,
+      attachment: false,
+      input: { text: true, image: true, audio: false, video: false, pdf: false },
+      output: { text: true, image: false, audio: false, video: false, pdf: false },
+    },
+    // Settings the user configured for hy4 only.
+    cost: { input: 3, output: 15, cache: { read: 0.3, write: 0 } },
+    options: { temperature: 0.2 },
+    headers: { "x-team": "a" },
+    variants: { high: {} },
+  };
+  const gw = mockGateway(async () =>
+    new Response(
+      JSON.stringify({ ok: true, service: "aiProxy", version: "1.3.0", env: "env-test-1", models: ["hy4", "hy3", "custom-vision"] }),
+      { status: 200 },
+    ),
+  );
+  try {
+    const refined = await hooks.provider.models({ models: { hy4 } }, { auth: fakeAuth() });
+    assert.deepEqual(refined.hy4, hy4);
+    assert.equal(refined.hy3.id, "hy3");
+    assert.equal(refined.hy3.name, "Hunyuan 3");
+    assert.equal(refined.hy3.api.id, "hy3");
+    assert.equal(refined.hy3.api.url, hy4.api.url);
+    assert.deepEqual(refined.hy3.limit, { context: 262_144, output: 16_384 });
+    assert.deepEqual(refined.hy3.capabilities.input, { text: true, image: false, audio: false, video: false, pdf: false });
+    assert.equal(refined.hy3.capabilities.toolcall, true);
+    assert.equal(refined.hy3.modalities, undefined);
+    assert.deepEqual(refined.hy3.cost, { input: 0, output: 0, cache: { read: 0, write: 0 } });
+    assert.deepEqual([refined.hy3.options, refined.hy3.headers, refined.hy3.variants], [{}, {}, {}]);
+    assert.equal(refined["custom-vision"].capabilities.input.image, true);
+    assert.equal(refined["custom-vision"].api.id, "custom-vision");
+    // The sibling used as a template is not modified.
+    assert.equal(hy4.capabilities.input.image, true);
+    assert.equal(hy4.api.id, "hy4");
+    assert.equal(hy4.cost.input, 3);
+  } finally {
+    gw.restore();
+  }
+});
+
+test("provider.models refines the list from aiProxy ping; failures keep the static list", async () => {
+  const { hooks } = await makePlugin();
+  const base = {
+    hy3: { name: "Hunyuan 3", limit: { context: 262_144, output: 16_384 }, tool_call: false },
+    "hy4-preview": { name: "Hunyuan 4 Preview", limit: { context: 1_000_000, output: 16_384 }, tool_call: false },
+    // Simulate stale config-hook entries carrying `disabled: true`.
+    hy4: { name: "Hunyuan 4 (unverified)", limit: { context: 131_072, output: 16_384 }, tool_call: false, disabled: true },
+    "deepseek-v4.1-flash-1017": { name: "DeepSeek V4.1 Flash 1017", limit: { context: 131_072, output: 16_384 }, tool_call: false, disabled: true },
+  };
+
+  const gw = mockGateway(async () =>
+    new Response(
+      JSON.stringify({
+        ok: true,
+        service: "aiProxy",
+        version: "1.0.0",
+        env: "env-test-1",
+        models: ["hy3", "deepseek-v4.1-flash", "deepseek-v4.1-flash-1017", "hy4"],
+      }),
+      { status: 200 },
+    ),
+  );
+  try {
+    const refined = await hooks.provider.models({ models: base }, { auth: fakeAuth() });
+    assert.deepEqual(
+      Object.keys(refined).sort(),
+      ["deepseek-v4.1-flash", "deepseek-v4.1-flash-1017", "hy3", "hy4"],
+    );
+    assert.equal(refined.hy3.name, "Hunyuan 3");
+    // An id missing from the stored list is rebuilt from the catalog.
+    assert.deepEqual(refined["deepseek-v4.1-flash"].modalities, { input: ["text", "image"], output: ["text"] });
+    assert.equal(refined["deepseek-v4.1-flash"].limit.context, 1_000_000);
+    // A model the deployed function's allowlist explicitly returns must not
+    // keep a stale `disabled: true` from the static catalog.
+    assert.equal(refined["deepseek-v4.1-flash-1017"].disabled, undefined, "1017 must lose its disabled flag");
+    assert.equal(refined.hy4.disabled, undefined, "ping-allowed hy4 must lose its disabled flag too");
+    // Models absent from the ping reply are dropped (hy4-preview not pinged).
+    assert.equal(refined["hy4-preview"], undefined);
+
+    const pingBody = JSON.parse(gw.calls[0].init.body);
+    assert.deepEqual(pingBody, { action: "ping" });
+    assert.equal(gw.calls[0].url, "https://env-test-1.api.tcloudbasegateway.com/v1/functions/aiProxy");
+  } finally {
+    gw.restore();
+  }
+
+  const gwFail = mockGateway(async () => new Response(JSON.stringify({ code: "FUNCTIONS_NOT_FOUND", message: "x" }), { status: 404 }));
+  try {
+    const kept = await hooks.provider.models({ models: base }, { auth: fakeAuth() });
+    assert.strictEqual(kept, base, "the host recognizes discovery fallback by reference");
+  } finally {
+    gwFail.restore();
+  }
+
+  const noAuth = await hooks.provider.models({ models: base }, {});
+  assert.strictEqual(noAuth, base);
+});
+
+/* ---------------- privacy ---------------- */
+
+const IMAGE_MODEL = "cloudbase/hy-image-v3.5-preview";
+
+test("live image toggle updates fallback listings without mutating the startup catalog", async () => {
+  const imageId = IMAGE_MODEL.split("/")[1];
+  for (const initial of [true, false]) {
+    let enabled = initial;
+    const hooks = await CloudbaseBridge({ magpie: { option: () => enabled } });
+    const config = {};
+    await hooks.config(config);
+    const models = config.provider.cloudbase.models;
+    enabled = !enabled;
+    const assertToggle = map => {
+      assert.equal(Object.hasOwn(map, imageId), enabled);
+      assert.equal(Object.hasOwn(models, imageId), initial);
+      assert.equal(map.hy4, models.hy4);
+    };
+    assertToggle(await hooks.provider.models({ models }, {}));
+    for (const failed of [false, true]) {
+      const gw = mockGateway(async () => Response.json({ ok: true, models: [] }, { status: failed ? 500 : 200 }));
+      try {
+        const kept = await hooks.provider.models({ models }, { auth: fakeAuth() });
+        assertToggle(kept);
+        if (failed) assert.equal(kept[Symbol.for("magpie.fellBack")], true);
+      } finally { gw.restore(); }
+    }
+  }
+});
+
+test("image alias is opt-in, survives chat discovery and uses a separate function", async () => {
+  let enabled = true;
+  const hooks = await CloudbaseBridge({ magpie: { option: (p,k) => p === "cloudbase" && k === "image_generation" && enabled } });
+  const config = {};
+  await hooks.config(config);
+  const base = config.provider.cloudbase.models;
+  const imageId = IMAGE_MODEL.split("/")[1];
+  assert.deepEqual(base[imageId].modalities, { input: ["text"], output: ["text"] });
+  assert.equal(base[imageId].tool_call, false);
+  const url = "https://example.org/output.png?signature=one%2Btwo";
+  const gw = mockGateway(async (_, init) => {
+    const event = JSON.parse(init.body);
+    return Response.json(event.action === "ping" ? { ok: true, models: ["hy4"] } :
+      event.action === "chat" ? aiProxyCompletion("chat works") : { ok: true, url, width: 1024, height: 1024 });
+  });
+  try {
+    const refined = await hooks.provider.models({ models: base }, { auth: fakeAuth() });
+    assert.deepEqual(Object.keys(refined).sort(), [imageId, "hy4"].sort());
+    const doFetch = await loaderFetch(hooks);
+    for (const stream of [false, true]) {
+      const res = await doFetch(chatBody({ model: IMAGE_MODEL, stream, tools: [{}], messages: [
+        { role: "system", content: "do not forward" }, { role: "user", content: "old" },
+        { role: "assistant", content: "old URL" },
+        { role: "user", content: [{ type: "text", text: "画一只猫" }, { type: "text", text: "水彩风格" }] },
+      ] }));
+      assert.equal(res.status, 200);
+      const call = gw.calls.at(-1);
+      assert.match(call.url, /\/v1\/functions\/generateImage$/);
+      assert.equal(call.init.headers.authorization, `Bearer ${TEST_KEY}`);
+      assert.deepEqual(JSON.parse(call.init.body), { prompt: "画一只猫\n水彩风格" });
+      if (stream) {
+        const text = await res.text();
+        assert.ok(text.includes(url) && text.includes("data: [DONE]"));
+      } else {
+        const json = await res.json();
+        assert.equal(json.model, IMAGE_MODEL);
+        assert.deepEqual(json.choices[0].message, { role: "assistant", content: url });
+      }
+    }
+    assert.equal((await (await doFetch(chatBody({ model: "cloudbase/hy4" }))).json()).choices[0].message.content, "chat works");
+    assert.match(gw.calls.at(-1).url, /\/aiProxy$/);
+    enabled = false;
+    assert.equal((await doFetch(chatBody({ model: IMAGE_MODEL }))).status, 404);
+    enabled = true;
+    for (const last of [{ role: "tool", content: "do not replay" }, { role: "user", content: " " },
+      { role: "user", content: [{ type: "image_url", image_url: { url } }] }]) {
+      const res = await doFetch(chatBody({ model: IMAGE_MODEL, messages: [{ role: "user", content: "old" }, last] }));
+      assert.equal(res.status, 400);
+    }
+    assert.equal(gw.calls.length, 4);
+  } finally { gw.restore(); }
+});
+
+test("DSH image replies carry one inline image and its original link in JSON and SSE", async () => {
+  const fetchChat = await loaderFetch(await CloudbaseBridge({}, { image_generation: true }));
+  const messages = [{ role: "system", content: "You are an AI agent powered by DeepSeek Harness." },
+    { role: "user", content: "画猫" }];
+  let url = "https://example.org/cat(1).png?q-key-time=123;456&q-signature=a%2Bb%3D&copy;=1";
+  const destination = "<https://example.org/cat(1).png?q-key-time=123;456&amp;q-signature=a%2Bb%3D&amp;copy;=1>";
+  const markdown = `![生成的图片](${destination})\n\n[打开原图](${destination})`;
+  const gw = mockGateway(async () => Response.json({ url }));
+  const request = stream => fetchChat(chatBody({ model: IMAGE_MODEL, messages, stream }));
+  try {
+    assert.equal((await (await request(false)).json()).choices[0].message.content, markdown);
+    const frames = (await (await request(true)).text()).split("\n").filter(line => line.startsWith("data: "));
+    assert.equal(frames.pop(), "data: [DONE]");
+    assert.equal(frames.map(line => JSON.parse(line.slice(6)).choices[0].delta.content ?? "").join(""), markdown);
+    for (url of ["https://example.org/a>.png", "https://example.org/a\\b", "https://example.org/a\u0001x"]) {
+      assert.equal((await request(false)).status, 502);
+    }
+    assert.ok(gw.calls.every(c => c.url.endsWith("/v1/functions/generateImage")));
+    assert.equal(gw.calls.length, 5);
+  } finally { gw.restore(); }
+});
+
+test("DSH title and runtime reminders never reach the image function", async () => {
+  const doFetch = await loaderFetch(await CloudbaseBridge({}, { image_generation: true }));
+  const system = content => ({ role: "system", content });
+  const user = content => ({ role: "user", content });
+  const title = [
+    system("Create a concise title for an AI coding-assistant session from the supplied human messages.\nReturn only the title."),
+    user('Generate the session title from this JSON array of human messages:\n[{"seq":8,"text":"橘猫"}]'),
+  ];
+  const agent = system("You are an AI agent powered by DeepSeek Harness.");
+  const reminder = user("<system-reminder>\nCurrent working directory: /private/workspace\n</system-reminder>");
+  const gw = mockGateway(async () => Response.json({ url: "https://example.org/cat.png" }));
+  const request = (messages, stream = false) => doFetch(chatBody({ model: IMAGE_MODEL, messages, stream }));
+  try {
+    assert.equal((await (await request(title)).json()).choices[0].message.content, "图片生成");
+    assert.equal((await (await request([{ ...title[0], role: "developer" }, title[1]])).json()).choices[0].message.content, "图片生成");
+    assert.match(await (await request(title, true)).text(), /data: \[DONE\]/);
+    assert.equal((await (await request([title[0], user('Update the session title from this JSON object:\n{}')])).json()).choices[0].message.content, "图片生成");
+    for (const last of [{ role: "assistant", content: "old URL" }, { role: "tool", content: "old result" },
+      user([{ type: "image_url", image_url: { url: "https://example.org/old" } }])]) {
+      assert.equal((await request([agent, user("old prompt"), last, reminder])).status, 400);
+    }
+    assert.equal((await request([agent, reminder])).status, 400);
+    assert.equal((await request([agent, user("画橘猫"), reminder, reminder])).status, 200);
+    assert.deepEqual(gw.calls.map(c => JSON.parse(c.init.body)), [{ prompt: "画橘猫" }]);
+  } finally { gw.restore(); }
+});
+
+test("markerless DSH runtime context selects previews without replacing the human prompt", async () => {
+  const doFetch = await loaderFetch(await CloudbaseBridge({}, { image_generation: true }));
+  const user = content => ({ role: "user", content });
+  const ask = user("画橘猫");
+  const clock = user("Time sampled while preparing turn 1, step 1: 2026-11-25T23:04:35+08:00[Asia/Singapore]\nBrowser time zone for this request: unavailable.\nElapsed since the preceding model-visible message: unavailable.");
+  const snapshot = user("<system-reminder>\nThe following information describes your current session:\n\nCurrent DSH file policy: test\n</system-reminder>");
+  const gw = mockGateway(async () => Response.json({ url: "https://example.org/cat.png" }));
+  const call = async messages => (await (await doFetch(chatBody({ model: IMAGE_MODEL, messages }))).json()).choices[0].message.content;
+  try {
+    for (const messages of [[ask, clock], [ask, snapshot], [ask, snapshot, clock],
+      [ask, clock, { role: "assistant", content: "previous response" }, ask],
+      [{ role: "developer", content: "You are an AI agent powered by DeepSeek Harness." }, ask]]) {
+      assert.match(await call(messages), /\[打开原图\]/);
+    }
+    assert.ok(gw.calls.every(c => JSON.parse(c.init.body).prompt === "画橘猫"));
+    assert.equal(await call([ask]), "https://example.org/cat.png");
+    const n = gw.calls.length;
+    for (const metadata of [clock, snapshot]) {
+      assert.equal((await doFetch(chatBody({ model: IMAGE_MODEL, messages: [metadata] }))).status, 400);
+    }
+    assert.equal(gw.calls.length, n);
+  } finally { gw.restore(); }
+});
+
+test("explicit preview toggle works without any client marker but does not enable the image model", async () => {
+  let generate = false, inline = true;
+  const hooks = await CloudbaseBridge({ magpie: { option: (_, k) => k === "image_generation" ? generate : inline } });
+  assert.equal(hooks.auth.options.find(o => o.key === "image_inline_preview").default, false);
+  const doFetch = await loaderFetch(hooks);
+  const call = () => doFetch(chatBody({ model: IMAGE_MODEL }));
+  const gw = mockGateway(async () => Response.json({ url: "https://example.org/cat.png" }));
+  try {
+    assert.equal((await call()).status, 404);
+    assert.equal(gw.calls.length, 0);
+    generate = true;
+    assert.match((await (await call()).json()).choices[0].message.content, /\[打开原图\]/);
+    inline = false;
+    assert.equal((await (await call()).json()).choices[0].message.content, "https://example.org/cat.png");
+    assert.deepEqual(gw.calls.map(c => JSON.parse(c.init.body)), [{ prompt: "hi" }, { prompt: "hi" }]);
+  } finally { gw.restore(); }
+});
+
+test("DSH web clock is metadata, not the image prompt; ambiguous turns do not incur a call", async () => {
+  const doFetch = await loaderFetch(await CloudbaseBridge({}, { image_generation: true }));
+  const agent = { role: "system", content: "You are an AI agent powered by DeepSeek Harness." };
+  const user = content => ({ role: "user", content });
+  const clock = [
+    "Time sampled while preparing turn 1, step 1: 2026-11-25T22:39:26+08:00[Asia/Singapore]",
+    "Browser time zone for this request: Asia/Singapore. Interpret otherwise-unqualified dates and times in this zone.",
+    "Elapsed since the preceding model-visible message: unavailable.",
+  ].join("\n");
+  const reminder = user("<system-reminder>\nruntime context\n</system-reminder>");
+  const prompt = "画一只戴蓝色围巾的橘猫，水彩风格";
+  const call = (...tail) => doFetch(chatBody({ model: IMAGE_MODEL, messages: [agent, ...tail] }));
+  const gw = mockGateway(async () => Response.json({ url: "https://example.org/cat.png" }));
+  try {
+    assert.equal((await call(user(prompt), reminder, user(clock))).status, 200);
+    assert.equal((await call(user("old"), { role: "assistant", content: "done" },
+      user(prompt), user([{ type: "text", text: clock }]), reminder)).status, 200);
+    assert.equal((await call(user("old"), { role: "assistant", content: "done" }, user(clock))).status, 400);
+    assert.equal((await call(user(prompt), user("unknown injected text"), user(clock))).status, 400);
+    const literal = "画一张写着 Browser time zone for this request: Asia/Singapore 的海报";
+    assert.equal((await call(user(literal))).status, 200);
+    assert.deepEqual(gw.calls.map(c => JSON.parse(c.init.body).prompt), [prompt, prompt, literal]);
+  } finally { gw.restore(); }
+});
+
+test("image requests surface function errors, reject invalid image URLs and never fall back to chat", async () => {
+  const doFetch = await loaderFetch(await CloudbaseBridge({}, { image_generation: true }));
+  for (const [reply, status, code] of [
+    [{ ok: false, stage: "generate", code: "AI_CHANNEL_NOT_ALLOWED", message: "denied" }, 403, "AI_CHANNEL_NOT_ALLOWED"],
+    [{ ok: true, url: "javascript:alert(1)" }, 502, "INVALID_FUNCTION_RESPONSE"],
+    [{}, 502, "INVALID_FUNCTION_RESPONSE"],
+  ]) {
+    const gw = mockGateway(async () => Response.json(reply));
+    try {
+      const res = await doFetch(chatBody({ model: IMAGE_MODEL }));
+      assert.equal(res.status, status);
+      assert.equal((await res.json()).error.code, code);
+      assert.equal(gw.calls.length, 1);
+    } finally { gw.restore(); }
+  }
+});
+
+test("nothing in logs or error payloads contains the API key or message content", async () => {
+  const { hooks, logs } = await makePlugin();
+  const gw = mockGateway(async () =>
+    new Response(JSON.stringify({ code: "PERMISSION_DENIED", message: "bad key" }), { status: 401 }),
+  );
+  try {
+    const doFetch = await loaderFetch(hooks, fakeAuth({}));
+    await doFetch(chatBody({ messages: [{ role: "user", content: "SECRET-CONVERSATION-CONTENT" }] }));
+    const logged = JSON.stringify(logs);
+    assert.ok(!logged.includes(TEST_KEY), "logs must not contain the API key");
+    assert.ok(!logged.includes("SECRET-CONVERSATION-CONTENT"), "logs must not contain conversation content");
+  } finally {
+    gw.restore();
+  }
+});
